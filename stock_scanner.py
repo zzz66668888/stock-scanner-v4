@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-股票技术形态自动扫描系统 v5.0
-数据源：baostock + 东方财富港股通
+股票技术形态自动扫描系统 v5.2
+数据源：tushare pro(主) + baostock(备) + 东方财富港股通
 全量扫描A股全部股票 + 港股通标的
 形态：底背离 / 上升趋势(左侧交易) / 首板 / 连板 / 顶背离 / 底部即将启动
 每只匹配股票附带分析说明
@@ -14,6 +14,42 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import baostock as bs
+
+# Tushare Pro - 优先使用购买的token
+TUSHARE_TOKENS = [
+    'ppqq5e5c1eb3bdf1c92d33fb58abbd123ef0dc25441b2b4ac06c51c1',  # 购买的token（优先）
+    '5ef8653d988f06566b63d4fd869a9e227b9c4c4dad399a4d1315a6c5',  # 原始token（备用）
+]
+
+tushare_pro = None
+TUSHARE_AVAILABLE = False
+
+def init_tushare():
+    """初始化tushare，尝试多个token"""
+    global tushare_pro, TUSHARE_AVAILABLE
+    try:
+        import tushare as ts
+        for i, token in enumerate(TUSHARE_TOKENS):
+            try:
+                ts.set_token(token)
+                pro = ts.pro_api()
+                # 测试token
+                df = pro.stock_basic(exchange='', list_status='L', fields='ts_code', limit=1)
+                if df is not None and len(df) > 0:
+                    tushare_pro = pro
+                    TUSHARE_AVAILABLE = True
+                    print(f"[OK] Tushare Pro 初始化成功 (Token {i+1})")
+                    return True
+            except Exception as e:
+                print(f"[WARN] Token {i+1} 失败: {e}")
+                continue
+        print("[WARN] 所有Token均不可用")
+        return False
+    except Exception as e:
+        print(f"[WARN] Tushare 初始化异常: {e}")
+        return False
+
+init_tushare()
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -73,7 +109,30 @@ def fetch_a_stock_list():
     cached = get_cache('a_list')
     if cached: return cached
 
-    log("正在获取全部A股列表...")
+    # 优先使用tushare
+    if TUSHARE_AVAILABLE:
+        try:
+            log("正在通过Tushare获取A股列表...")
+            df = tushare_pro.stock_basic(exchange='', list_status='L',
+                                         fields='ts_code,symbol,name,area,industry,list_date')
+            all_stocks = []
+            for _, row in df.iterrows():
+                code = row['symbol']
+                # 排除北交所(8/4/9), B股(2)
+                if code.startswith(('8','4','9','2')): continue
+                all_stocks.append({
+                    'code': code, 'name': row['name'],
+                    'full_code': row['ts_code'],
+                    'market': 'SH' if code.startswith('6') else 'SZ',
+                })
+            log(f"A股列表(Tushare): {len(all_stocks)}只")
+            set_cache('a_list', all_stocks)
+            return all_stocks
+        except Exception as e:
+            log(f"Tushare获取失败，降级到baostock: {e}")
+
+    # 降级到baostock
+    log("正在通过baostock获取A股列表...")
     try:
         rs = bs.query_stock_basic()
         if rs.error_code != '0':
@@ -83,11 +142,9 @@ def fetch_a_stock_list():
         all_stocks = []
         while rs.next():
             row = rs.get_row_data()
-            # baostock: code, code_name, ipoDate, outDate, type, status
             code = row[0]; name = row[1]; stock_type = row[4]; status = row[5]
             if status != '1' or stock_type != '1': continue
             short = code.split('.')[-1]
-            # 排除北交所(8/4/9), B股(2)
             if short.startswith(('8','4','9','2')): continue
             all_stocks.append({
                 'code': short, 'name': name,
@@ -95,7 +152,7 @@ def fetch_a_stock_list():
                 'market': 'SH' if code.startswith('sh') else 'SZ',
             })
 
-        log(f"A股列表: {len(all_stocks)}只")
+        log(f"A股列表(baostock): {len(all_stocks)}只")
         set_cache('a_list', all_stocks)
         return all_stocks
     except Exception as e:
@@ -181,6 +238,31 @@ def fetch_stock_history(code, market='A', days=120):
 
     try:
         if market == 'A':
+            # 优先使用tushare
+            if TUSHARE_AVAILABLE:
+                try:
+                    ts_code = f'{code}.SH' if code.startswith('6') else f'{code}.SZ'
+                    end_date = datetime.now().strftime('%Y%m%d')
+                    start_date = (datetime.now() - timedelta(days=days+30)).strftime('%Y%m%d')
+                    df = tushare_pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date,
+                                           fields='trade_date,open,high,low,close,vol,amount')
+                    if df is not None and len(df) >= 20:
+                        df = df.sort_values('trade_date')  # tushare返回倒序，需排序
+                        result = {
+                            'dates': df['trade_date'].tolist(),
+                            'open': df['open'].astype(float).tolist(),
+                            'close': df['close'].astype(float).tolist(),
+                            'high': df['high'].astype(float).tolist(),
+                            'low': df['low'].astype(float).tolist(),
+                            'volume': df['vol'].astype(float).tolist(),
+                            'turnover': [0]*len(df),  # tushare日线无换手率，后续可补充
+                        }
+                        set_cache(ck, result)
+                        return result
+                except Exception as e:
+                    log(f"Tushare K线获取失败，降级到baostock: {e}")
+
+            # 降级到baostock
             bs_code = f'sh.{code}' if code.startswith('6') else f'sz.{code}'
             end = datetime.now().strftime('%Y-%m-%d')
             start = (datetime.now() - timedelta(days=days+30)).strftime('%Y-%m-%d')
@@ -188,7 +270,7 @@ def fetch_stock_history(code, market='A', days=120):
                 'date,open,close,high,low,volume,amount,turn,pctChg',
                 start_date=start, end_date=end, frequency='d', adjustflag='2')
             if rs.error_code != '0':
-                ensure_baostock()  # 自动重连
+                ensure_baostock()
                 return None
             data = rs.get_data()
             if data is None or len(data) < 20: return None
@@ -618,50 +700,59 @@ def analyze_sentiment(df, stock_info=None):
 
 # ========== 分析入口 ==========
 
-def analyze_stock(stock, market='A', patterns=None):
+def analyze_stock(stock, market='A', patterns=None, auction_data=None):
     if patterns is None:
         patterns = ['bottom_divergence','uptrend','first_limit_up',
                     'consecutive_limit_up','top_divergence','bottom_launch',
                     'potential_first_board','potential_continue_board']
     h = fetch_stock_history(stock['code'], market, 60)
-    if h is None or len(h['close']) < 30: return None
-    df = pd.DataFrame({'open':h['open'],'close':h['close'],'high':h['high'],
-                       'low':h['low'],'volume':h['volume'],
-                       'turnover':h.get('turnover', [0]*len(h['close']))})
 
-    latest = h['close'][-1]; prev = h['close'][-2] if len(h['close'])>=2 else latest
-    chg = round((latest/prev-1)*100,2)
+    # 构造结果基础字段
+    latest = 0; prev = 0; chg = 0
+    if h is not None and len(h['close']) >= 30:
+        latest = h['close'][-1]; prev = h['close'][-2] if len(h['close'])>=2 else latest
+        chg = round((latest/prev-1)*100,2)
+    elif auction_data:
+        latest = auction_data.get('latest', auction_data.get('auction_price', 0)) or 0
+        prev = auction_data.get('prev_close', 0)
+        chg = auction_data.get('change_pct', 0) or round((latest/prev-1)*100,2) if latest and prev else 0
 
-    # 情绪因子分析
-    sent_score, sent_summary, sent_indicators = analyze_sentiment(df, stock)
-
-    r = {'code':stock['code'],'name':stock['name'],'price':round(latest,2),
+    r = {'code':stock['code'],'name':stock.get('name',''),'price':round(latest,2) if latest else 0,
          'change_pct':chg,'market':market,'patterns':[],
-         'sentiment':{'score':sent_score,'summary':sent_summary,'indicators':sent_indicators}}
+         'sentiment':{'score':50,'summary':'','indicators':{}}}
 
-    checks = {
-        'bottom_divergence': ('底背离','buy',detect_bottom_divergence),
-        'uptrend': ('上升趋势(左侧)','buy',detect_uptrend),
-        'first_limit_up': ('首板','buy',lambda d: detect_first_limit_up(d, market)),
-        'consecutive_limit_up': ('连板','buy',lambda d: detect_consecutive_limit_up(d, market)),
-        'top_divergence': ('顶背离','sell',detect_top_divergence),
-        'bottom_launch': ('底部即将启动','buy',detect_bottom_launch),
-        'potential_first_board': ('次日可能首板','buy',lambda d: detect_potential_first_board(d, market)),
-        'potential_continue_board': ('次日可能再板','buy',lambda d: detect_potential_continue_board(d, market)),
-    }
-    for p in patterns:
-        if p in checks:
-            name,sig,fn = checks[p]
-            ok,val,analysis = fn(df)
-            if ok:
-                dis = name
-                if p == 'consecutive_limit_up': dis = f'连板({val}连板)'; val = val*20
-                # 把情绪因子附加到分析说明末尾
-                full_analysis = analysis + ' ' + sent_summary
-                r['patterns'].append({
-                    'type':p,'name':dis,'strength':round(val,1),
-                    'signal':sig,'analysis':full_analysis
-                })
+    # K线数据有效时才做K线类形态分析
+    if h is not None and len(h['close']) >= 30:
+        df = pd.DataFrame({'open':h['open'],'close':h['close'],'high':h['high'],
+                           'low':h['low'],'volume':h['volume'],
+                           'turnover':h.get('turnover', [0]*len(h['close']))})
+
+        sent_score, sent_summary, sent_indicators = analyze_sentiment(df, stock)
+        r['sentiment'] = {'score':sent_score,'summary':sent_summary,'indicators':sent_indicators}
+
+        checks = {
+            'bottom_divergence': ('底背离','buy',detect_bottom_divergence),
+            'uptrend': ('上升趋势(左侧)','buy',detect_uptrend),
+            'first_limit_up': ('首板','buy',lambda d: detect_first_limit_up(d, market)),
+            'consecutive_limit_up': ('连板','buy',lambda d: detect_consecutive_limit_up(d, market)),
+            'top_divergence': ('顶背离','sell',detect_top_divergence),
+            'bottom_launch': ('底部即将启动','buy',detect_bottom_launch),
+            'potential_first_board': ('次日可能首板','buy',lambda d: detect_potential_first_board(d, market)),
+            'potential_continue_board': ('次日可能再板','buy',lambda d: detect_potential_continue_board(d, market)),
+        }
+        for p in patterns:
+            if p in checks:
+                name,sig,fn = checks[p]
+                ok,val,analysis = fn(df)
+                if ok:
+                    dis = name
+                    if p == 'consecutive_limit_up': dis = f'连板({val}连板)'; val = val*20
+                    full_analysis = analysis + ' ' + sent_summary
+                    r['patterns'].append({
+                        'type':p,'name':dis,'strength':round(val,1),
+                        'signal':sig,'analysis':full_analysis
+                    })
+
     return r if r['patterns'] else None
 
 # ========== API路由 ==========
@@ -705,9 +796,18 @@ def api_health():
 @app.route('/api/test')
 def api_test():
     results = {}; t0 = time.time()
+
+    # 数据源状态
+    results['数据源状态'] = {
+        'tushare': '✅ 已启用' if TUSHARE_AVAILABLE else '❌ 未启用',
+        'baostock': '✅ 备用中',
+        '东方财富': '✅ 港股/实时行情',
+        '当前A股数据源': 'Tushare Pro' if TUSHARE_AVAILABLE else 'Baostock'
+    }
+
     try:
         bs.login()
-        results['baostock登录'] = f'OK'
+        results['baostock登录'] = f'OK (备用)'
     except Exception as e:
         results['baostock登录'] = f'FAIL: {e}'
     try:
@@ -725,6 +825,17 @@ def api_test():
         results['港股通标的'] = f'OK ({len(sl)}只)'
     except Exception as e:
         results['港股通标的'] = f'FAIL: {e}'
+
+    # Tushare积分信息
+    if TUSHARE_AVAILABLE:
+        try:
+            # 查询积分
+            info = tushare_pro.query('user_info')
+            if info is not None and len(info) > 0:
+                results['Tushare积分'] = f'{info.iloc[0].get("积分", "未知")}'
+        except:
+            results['Tushare积分'] = '查询失败'
+
     return jsonify({'results':results,'logs':LOG[-20:]})
 
 @app.route('/api/scan', methods=['POST'])
@@ -759,11 +870,11 @@ def api_scan():
         log(f"扫描: {market} offset={offset} batch={batch_size}")
 
         # 排队分析(单线程+锁保护，避免baostock并发死锁)
-    for s in batch:
-        try:
-            a = analyze_stock(s, market, patterns)
-            if a: results.append(a)
-        except: pass
+        for s in batch:
+            try:
+                a = analyze_stock(s, market, patterns)
+                if a: results.append(a)
+            except: pass
 
     results.sort(key=lambda x: (len(x['patterns']),
                  max((p.get('strength',0) for p in x['patterns']),default=0)), reverse=True)
@@ -1577,37 +1688,79 @@ def fetch_fundamental_data(code, market='A'):
         result['summary'] = '港股基本面数据需通过东方财富F10页面查阅'
         return result
 
+    ts_code = f'{code}.SH' if code.startswith('6') else f'{code}.SZ'
+
+    # === Tushare: 公司信息 + 财务指标 ===
+    if TUSHARE_AVAILABLE:
+        try:
+            # 公司基本信息
+            company = tushare_pro.stock_company(ts_code=ts_code,
+                fields='ts_code,chairman,manager,reg_capital,setup_date,province,city,introduction,website,employees,main_business,business_scope')
+            if company is not None and len(company) > 0:
+                row = company.iloc[0]
+                result['main_business'] = str(row.get('main_business', '') or '')
+                result['company_intro'] = str(row.get('introduction', '') or '')[:800]
+                result['employees'] = str(row.get('employees', '') or '')
+                result['reg_addr'] = f"{row.get('province', '')}{row.get('city', '')}"
+                result['website'] = str(row.get('website', '') or '')
+
+            # 财务指标
+            indicator = tushare_pro.fina_indicator(ts_code=ts_code,
+                fields='ts_code,ann_date,roe,grossprofit_margin,netprofit_margin,debt_to_assets,eps,dt_eps,total_revenue,revenue')
+            if indicator is not None and len(indicator) > 0:
+                latest = indicator.iloc[0]
+                if latest.get('roe'): result['roe'] = f"{float(latest['roe']):.2f}%"
+                if latest.get('grossprofit_margin'): result['gross_margin'] = f"{float(latest['grossprofit_margin']):.2f}%"
+                if latest.get('netprofit_margin'): result['net_margin'] = f"{float(latest['netprofit_margin']):.2f}%"
+                if latest.get('debt_to_assets'): result['debt_ratio'] = f"{float(latest['debt_to_assets']):.2f}%"
+                if latest.get('eps'): result['eps'] = f"{float(latest['eps']):.4f}元"
+                if latest.get('total_revenue'): result['revenue'] = f"{float(latest['total_revenue'])/100000000:.2f}亿"
+
+            # 行业分类
+            try:
+                industry = tushare_pro.stock_basic(ts_code=ts_code, fields='ts_code,industry')
+                if industry is not None and len(industry) > 0:
+                    result['industry'] = str(industry.iloc[0].get('industry', '') or '')
+            except: pass
+
+            # 公司名称
+            try:
+                name_df = tushare_pro.stock_basic(ts_code=ts_code, fields='ts_code,name')
+                if name_df is not None and len(name_df) > 0:
+                    result['company_name'] = str(name_df.iloc[0].get('name', '') or '')
+            except: pass
+
+            log(f"基本面数据(Tushare): {code} {result['company_name']}")
+        except Exception as e:
+            log(f"Tushare基本面获取失败，降级到baostock: {e}")
+
+    # === 降级到baostock ===
     bs_code = f'sh.{code}' if code.startswith('6') else f'sz.{code}'
 
-    # === 1. 公司基本信息 ===
-    try:
-        rs = bs.query_stock_basic(bs_code)
-        if rs.error_code == '0':
-            while rs.next():
-                row = rs.get_row_data()
-                result['company_name'] = row[1]
-                result['ipo_date'] = row[2]
-                break
-    except:
-        pass
+    if not result['company_name']:
+        try:
+            rs = bs.query_stock_basic(bs_code)
+            if rs.error_code == '0':
+                while rs.next():
+                    row = rs.get_row_data()
+                    result['company_name'] = row[1]
+                    result['ipo_date'] = row[2]
+                    break
+        except: pass
 
-    # === 2. 行业分类(详细) ===
-    try:
-        rs = bs.query_stock_industry(bs_code)
-        if rs.error_code == '0':
-            inds = []
-            while rs.next():
-                row = rs.get_row_data()
-                # baostock字段: updateDate, code, code_name, industry, industryClassification
-                if len(row) >= 5:
-                    inds.append({'code': row[1], 'name': row[3], 'type': row[4]})
-            if inds:
-                result['industry'] = inds[-1]['name']
-                result['industry_detail'] = ' → '.join([i['name'] for i in inds])
-                if len(inds) >= 2:
-                    result['main_business_industry'] = f"所属{inds[-2]['name']}板块，主营{inds[-1]['name']}相关业务"
-    except:
-        pass
+    if not result['industry']:
+        try:
+            rs = bs.query_stock_industry(bs_code)
+            if rs.error_code == '0':
+                inds = []
+                while rs.next():
+                    row = rs.get_row_data()
+                    if len(row) >= 5:
+                        inds.append({'code': row[1], 'name': row[3], 'type': row[4]})
+                if inds:
+                    result['industry'] = inds[-1]['name']
+                    result['industry_detail'] = ' → '.join([i['name'] for i in inds])
+        except: pass
 
     # === 3. 财务数据(最近3年年报，保留趋势对比) ===
     year = datetime.now().year
@@ -2089,12 +2242,16 @@ tr:hover td{background:rgba(88,166,255,.04)}.up{color:var(--rd)}.dn{color:var(--
 .diag{background:var(--bg3);border:1px solid var(--bd);border-radius:8px;padding:16px;margin-bottom:20px}
 .diag h3{margin-bottom:12px;font-size:.95rem}
 .logp{background:#000;color:#0f0;font-family:monospace;font-size:.7rem;padding:10px;border-radius:8px;max-height:200px;overflow:auto;white-space:pre-wrap;display:none}
+.sort-btns{display:flex;gap:6px;align-items:center}
+.sort-btn{padding:3px 10px;border-radius:12px;font-size:.72rem;cursor:pointer;border:1px solid var(--bd);background:var(--bg);color:var(--tx2);transition:all .2s;white-space:nowrap}
+.sort-btn:hover{border-color:var(--bl);color:var(--tx)}
+.sort-btn.active{border-color:var(--bl);background:rgba(88,166,255,.15);color:var(--bl)}
 ::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-thumb{background:var(--bd);border-radius:3px}
 @media(max-width:768px){.hd{padding:10px 16px}.hd h1{font-size:1rem}.mc{padding:12px}.cr{flex-direction:column;align-items:stretch}}
 </style>
 </head>
 <body>
-<div class="hd"><div><h1>📊 股票技术形态自动扫描系统</h1><div style="font-size:.75rem;color:var(--tx2);margin-top:2px">8种形态+情绪因子 | 换手率/量比/连阳/振幅/涨速 | A股+港股通全量扫描</div></div>
+<div class="hd"><div><h1>📊 股票技术形态自动扫描系统</h1><div style="font-size:.75rem;color:var(--tx2);margin-top:2px">9种形态+情绪因子 | 换手率/量比/连阳/振幅/涨速 | A股+港股通全量扫描 | <span id="auctionStatus" style="color:var(--or)"></span></div></div>
 <div class="st"><span><span class="sd ok" id="sd"></span> <span id="stx">就绪</span></span><span style="color:var(--tx2)" id="clk"></span></div></div>
 <div class="mc">
 <div class="cp"><div class="cr">
@@ -2114,7 +2271,7 @@ tr:hover td{background:rgba(88,166,255,.04)}.up{color:var(--rd)}.dn{color:var(--
 </div></div>
 <div id="errs"></div>
 <div class="sb"><div>进度: <span class="sv" id="ss">-</span></div><div>匹配: <span class="sv" id="sm">-</span></div><div>耗时: <span class="sv" id="stm">-</span></div><div class="pbar"><div class="pbar-fill" id="pfill" style="width:0%"></div></div></div>
-<div class="rw"><div class="thd"><span>扫描结果（每只匹配股票附分析说明）</span><span id="rc" style="color:var(--tx2)">等待扫描...</span></div>
+<div class="rw"><div class="thd"><span>扫描结果（每只匹配股票附分析说明）</span><div class="sort-btns"><span class="sort-btn active" data-sort="strength" onclick="sortBy(this)">按强度</span><span class="sort-btn" data-sort="sentiment" onclick="sortBy(this)">🔥按情绪</span><span class="sort-btn" data-sort="patterns" onclick="sortBy(this)">按形态数</span><span id="rc" style="color:var(--tx2);margin-left:8px">等待扫描...</span></div></div>
 <div class="ts"><table><thead><tr><th style="width:50px">市场</th><th style="width:70px">代码</th><th style="width:75px">名称</th><th style="width:55px">现价</th><th style="width:55px">涨跌</th><th style="width:55px">情绪</th><th style="width:170px">形态</th><th>分析说明(含情绪)</th></tr></thead>
 <tbody id="rb"><tr><td colspan="8"><div class="emp"><p style="font-size:2.5rem">📊</p><p>点击 <b>"测试200只"</b> 快速测试 | <b>"全量扫描"</b> 扫描全部</p><p style="font-size:.8rem;color:var(--tx2)">含情绪因子: 换手率/量比/连阳/振幅/涨速</p></div></td></tr></tbody></table></div></div>
 <div id="logPanel" class="logp"></div>
@@ -2147,7 +2304,8 @@ tr:hover td{background:rgba(88,166,255,.04)}.up{color:var(--rd)}.dn{color:var(--
 <script>
 let mk=['A','HK'];let pt=['bottom_divergence','uptrend','first_limit_up','consecutive_limit_up','potential_first_board','potential_continue_board','top_divergence','bottom_launch'];
 let timer=null;let busy=false;let polling=null;
-setInterval(()=>document.getElementById('clk').textContent=new Date().toLocaleString('zh-CN',{hour12:false}),1000);
+function checkAuction(){let n=new Date(),h=n.getHours(),m=n.getMinutes(),d=n.getDay(),el=document.getElementById('auctionStatus');if(d===0||d===6){el.textContent='周末休市';el.style.color='var(--tx2)';return}if(h===9&&m>=15&&m<=25){el.textContent='⚡竞价进行中 9:'+String(m).padStart(2,'0');el.style.color='var(--or)'}else if(h===9&&m>=25&&m<=30){el.textContent='竞价结束 等待开盘';el.style.color='var(--yl)'}else if((h===9&&m>=30)||(h>=10&&h<11)||(h===11&&m<=30)||(h===13&&m>=0)||(h>=14&&h<15)){el.textContent='盘中交易';el.style.color='var(--gn)'}else if((h>=0&&h<9)||(h===9&&m<15)){el.textContent='盘前';el.style.color='var(--tx2)'}else{el.textContent='已收盘';el.style.color='var(--tx2)'}}
+setInterval(()=>{document.getElementById('clk').textContent=new Date().toLocaleString('zh-CN',{hour12:false});checkAuction()},1000);
 function ss(s,t){document.getElementById('sd').className='sd '+s;document.getElementById('stx').textContent=t}
 function tM(m){let e=document.getElementById('m'+m),i=mk.indexOf(m);i>=0?(mk.splice(i,1),e.classList.remove('on')):(mk.push(m),e.classList.add('on'))}
 function tP(e){e.classList.toggle('on');let p=e.dataset.p,i=pt.indexOf(p);i>=0?pt.splice(i,1):pt.push(p)}
@@ -2157,8 +2315,25 @@ async function testConn(){
   try{
     let r=await fetch('/api/test'),d=await r.json();
     let h='<div class="diag"><h3>🔍 诊断结果</h3>';
+
+    // 数据源状态单独显示
+    let ds=d.results['数据源状态'];
+    if(ds){
+      h+=`<div style="background:var(--bg);border:1px solid var(--bl);border-radius:8px;padding:12px;margin-bottom:12px">
+        <div style="font-weight:600;color:var(--bl);margin-bottom:8px">📊 数据源状态</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:.82rem">
+          <div>Tushare Pro: ${ds.tushare}</div>
+          <div>Baostock: ${ds.baostock}</div>
+          <div>东方财富: ${ds['东方财富']}</div>
+          <div style="font-weight:600;color:var(--gn)">当前A股源: ${ds['当前A股数据源']}</div>
+        </div>
+      </div>`;
+      delete d.results['数据源状态'];
+    }
+
     for(let[k,v]of Object.entries(d.results)){
-      let ok=v.startsWith('OK');
+      if(typeof v==='object')continue; // 跳过对象类型的值
+      let ok=typeof v==='string' && v.startsWith('OK');
       h+=`<div style="padding:6px 0;border-bottom:1px solid var(--bd)"><span style="color:${ok?'var(--gn)':'var(--rd)'}">${ok?'✅':'❌'}</span> <b>${k}:</b> ${v}</div>`;
     }
     h+='</div>';if(d.logs)document.getElementById('logPanel').textContent=d.logs.join('\n');
@@ -2224,6 +2399,21 @@ async function scan(limit){
 
 function stopAR(){scanAborted=true;if(timer){clearInterval(timer);timer=null}document.getElementById('stb').style.display='none'}
 
+let currentSort='strength';
+function sortBy(el){
+  document.querySelectorAll('.sort-btn').forEach(b=>b.classList.remove('active'));
+  el.classList.add('active');
+  currentSort=el.dataset.sort;
+  if(!allScanResults.length)return;
+  if(currentSort==='sentiment'){
+    allScanResults.sort((a,b)=>((b.sentiment||{}).score||0)-((a.sentiment||{}).score||0));
+  }else if(currentSort==='patterns'){
+    allScanResults.sort((a,b)=>b.patterns.length-a.patterns.length);
+  }else{
+    allScanResults.sort((a,b)=>b.patterns.length-a.patterns.length||(b.patterns[0]?.strength||0)-(a.patterns[0]?.strength||0));
+  }
+  render(allScanResults);
+}
 function render(rs){
   let tb=document.getElementById('rb');
   if(!rs.length){tb.innerHTML='<tr><td colspan="8"><div class="emp"><p>未找到匹配形态</p><p style="font-size:.8rem;color:var(--tx2)">当前市场暂无满足条件的股票</p></div></td></tr>';return}
