@@ -16,8 +16,9 @@ import pandas as pd
 import baostock as bs
 
 # Tushare Pro - 优先使用购买的token
+import os
 TUSHARE_TOKENS = [
-    'ppqq5e5c1eb3bdf1c92d33fb58abbd123ef0dc25441b2b4ac06c51c1',  # 购买的token（优先）
+    os.environ.get('TUSHARE_TOKEN', 'ppqq5e5c1eb3bdf1c92d33fb58abbd123ef0dc25441b2b4ac06c51c1'),  # 环境变量或默认值
     '5ef8653d988f06566b63d4fd869a9e227b9c4c4dad399a4d1315a6c5',  # 原始token（备用）
 ]
 
